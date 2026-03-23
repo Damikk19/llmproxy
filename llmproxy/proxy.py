@@ -67,3 +67,26 @@ async def request(f_req, body_transform=None):
     except aiohttp.ClientError as e:
         app.logger.error("HTTP client error: %s", e)
         raise aiohttp.web.HTTPInternalServerError() from e
+
+
+async def check_response(app, b_name, b_res):
+    """Raise on backend error responses.
+
+    4xx errors are forwarded as-is (client errors from the backend).
+    5xx errors are masked with a generic 502 to avoid leaking internals.
+    """
+    if b_res.status < 400:
+        return
+
+    body = await b_res.read()
+
+    app.logger.error('Backend "%s" error: %d %s', b_name,
+        b_res.status, body[:1024].decode("utf-8", errors="replace"))
+
+    if b_res.status < 500:
+        exc = aiohttp.web.HTTPBadRequest(content_type=b_res.content_type)
+        exc.set_status(b_res.status)
+        exc.body = body
+        raise exc
+
+    raise aiohttp.web.HTTPBadGateway()
