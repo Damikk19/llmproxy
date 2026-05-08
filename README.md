@@ -31,6 +31,26 @@ pkill -f -HUP 'python3? .*llmproxy'
 docker kill -s=SIGHUP CONTAINER
 ```
 
+## Supported API endpoints
+
+The proxy supports `POST /v1/chat/completions`, `POST /v1/completions`,
+`POST /v1/embeddings`, `POST /v1/audio/transcriptions`, and
+`POST /v1/responses`.
+
+`POST /v1/responses` is a billing-aware passthrough for stateless
+`responses.create` requests. It is intentionally not a full implementation of
+OpenAI stateful Responses workflows. The proxy rejects `background: true`,
+`previous_response_id`, and `conversation` with `422 Unprocessable Entity`, and
+does not expose retrieve, cancel, delete, compact, or proxy-managed conversation
+state endpoints. The `store` flag is passed through to the backend, but clients
+should not rely on stored responses for workflows through this proxy until
+stateful response and conversation ownership is implemented.
+
+Responses billing maps `usage.input_tokens` to `MODEL/DEVICE/prompt` and
+`usage.output_tokens` to `MODEL/DEVICE/completion`. More precise billing for
+cache hits, reasoning tokens, tool usage, multimodal usage, and built-in tool
+costs requires a separate billing stage.
+
 ## Testing
 
 ```sh
