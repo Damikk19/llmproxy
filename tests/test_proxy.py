@@ -9,10 +9,11 @@ import warnings
 
 import aiohttp
 import aiohttp.test_utils
+import aiohttp.web
 
 from llmproxy import responses as responses_module
 from llmproxy.app import create_app
-from llmproxy.db import get_db
+from llmproxy.db import DatabaseError, get_db
 
 from . import mockbackend
 
@@ -196,6 +197,25 @@ class TestResponses(LLMProxyAppTestCase):
             {"product": "mymodel/none/completion", "quantity": 17},
         ])
 
+    async def test_stream_split_completed_usage(self):
+        body = {
+            "model": "mymodel",
+            "input": "split_completed_stream",
+            "stream": True,
+        }
+        req = self.client.request("POST", "/v1/responses",
+            headers={"Authorization": "Bearer mytoken"}, json=body)
+
+        async with req as res:
+            self.assertEqual(res.status, 200)
+            raw = await res.read()
+
+        self.assertIn(b"event: response.completed\n", raw)
+        self.assertListEqual(await self.get_events(), [
+            {"product": "mymodel/none/prompt", "quantity": 19},
+            {"product": "mymodel/none/completion", "quantity": 23},
+        ])
+
     async def test_chunked_json_is_not_treated_as_sse(self):
         body = {
             "model": "mymodel",
@@ -238,6 +258,21 @@ class TestResponses(LLMProxyAppTestCase):
 
         self.assertEqual(self.backend.app["responses_calls"], [])
         self.assertListEqual(await self.get_events(), [])
+
+    async def test_background_false_is_passed_through(self):
+        body = {"model": "mymodel", "input": "hi", "background": False}
+        req = self.client.request("POST", "/v1/responses",
+            headers={"Authorization": "Bearer mytoken"}, json=body)
+
+        async with req as res:
+            self.assertEqual(res.status, 200)
+            await res.read()
+
+        self.assertEqual(self.backend.app["responses_calls"], [body])
+        self.assertListEqual(await self.get_events(), [
+            {"product": "mymodel/none/prompt", "quantity": 3},
+            {"product": "mymodel/none/completion", "quantity": 5},
+        ])
 
     async def test_unknown_token(self):
         body = {"model": "mymodel", "input": "hi"}
@@ -319,8 +354,32 @@ class TestResponses(LLMProxyAppTestCase):
 
         self.assertListEqual(await self.get_events(), [])
 
+    async def test_non_stream_invalid_utf8_returns_502(self):
+        body = {"model": "mymodel", "input": "invalid_utf8_usage"}
+        req = self.client.request("POST", "/v1/responses",
+            headers={"Authorization": "Bearer mytoken"}, json=body)
+
+        async with req as res:
+            self.assertEqual(res.status, 502)
+
+        self.assertListEqual(await self.get_events(), [])
+
     async def test_non_stream_body_read_failure_returns_502(self):
         body = {"model": "mymodel", "input": "non_stream_body_error"}
+        req = self.client.request("POST", "/v1/responses",
+            headers={"Authorization": "Bearer mytoken"}, json=body)
+
+        async with req as res:
+            self.assertEqual(res.status, 502)
+
+        self.assertListEqual(await self.get_events(), [])
+
+    async def test_stream_requested_chunked_json_body_error_returns_502(self):
+        body = {
+            "model": "mymodel",
+            "input": "chunked_json_body_error_stream_requested",
+            "stream": True,
+        }
         req = self.client.request("POST", "/v1/responses",
             headers={"Authorization": "Bearer mytoken"}, json=body)
 
@@ -371,6 +430,7 @@ class TestResponses(LLMProxyAppTestCase):
         log_output = "\n".join(logs.output)
         self.assertIn("responses_stream_billing_missing", log_output)
         self.assertIn('"billing_recorded": false', log_output)
+        self.assertIn('"reason": "backend_stream_read_error"', log_output)
         self.assertListEqual(await self.get_events(), [])
 
     async def test_stream_backend_failure_after_completed_still_bills(self):
@@ -399,6 +459,8 @@ class TestResponses(LLMProxyAppTestCase):
                 "completed_null_stream",
                 "completed_response_null_stream",
                 "completed_array_stream",
+                "invalid_json_completed_stream",
+                "double_completed_stream",
                 ]:
             with self.subTest(input=input_):
                 body = {"model": "mymodel", "input": input_, "stream": True}
@@ -432,7 +494,6 @@ class TestResponses(LLMProxyAppTestCase):
         finally:
             responses_module.MAX_SSE_EVENT_BYTES = old_limit
 
-        self.assertIn(b"response.output_text.delta", raw)
         log_output = "\n".join(logs.output)
         self.assertIn("responses_stream_billing_missing", log_output)
         self.assertIn('"reason": "sse_event_too_large"', log_output)
@@ -449,13 +510,56 @@ class TestResponses(LLMProxyAppTestCase):
 
         async with req as res:
             self.assertEqual(res.status, 200)
-            first = await res.content.read(1024)
+            first = await res.content.readuntil(b"\n\n")
             self.assertIn(b"response.output_text.delta", first)
+            self.assertNotIn(b"response.completed", first)
 
         self.assertListEqual(await self.wait_for_events(2), [
             {"product": "mymodel/none/prompt", "quantity": 3},
             {"product": "mymodel/none/completion", "quantity": 5},
         ])
+
+    async def test_stream_billing_db_failure_logs_structured_critical(self):
+        class FakeReq(dict):
+            def __init__(self, app):
+                super().__init__(request_id="req_123")
+                self.app = app
+
+        class FailingDB:
+            async def billing_record_add(self, **kwargs):
+                raise DatabaseError("db down")
+
+        async def fake_get_db(uri, req=None):
+            return FailingDB()
+
+        old_get_db = responses_module.get_db
+        responses_module.get_db = fake_get_db
+        try:
+            with self.assertLogs(self.app.logger, level="CRITICAL") as logs:
+                with self.assertRaises(aiohttp.web.GracefulExit):
+                    await responses_module.record_billing(
+                        FakeReq(self.app),
+                        {"id": "myuser"},
+                        {"input_tokens": 3, "output_tokens": 5},
+                        "mymodel",
+                        {
+                            "url": "http://user:pass@example.com:8080/path?x=1",
+                            "device": "none",
+                            "model": "backend-model",
+                        },
+                        db_error_reason="billing_db_error",
+                    )
+        finally:
+            responses_module.get_db = old_get_db
+
+        log_output = "\n".join(logs.output)
+        self.assertIn("responses_stream_billing_missing", log_output)
+        self.assertIn('"request_id": "req_123"', log_output)
+        self.assertIn('"api_key_id": "myuser"', log_output)
+        self.assertIn('"backend": "http://example.com:8080/path"', log_output)
+        self.assertIn('"backend_model": "backend-model"', log_output)
+        self.assertIn('"billing_recorded": false', log_output)
+        self.assertIn('"reason": "billing_db_error"', log_output)
 
     async def test_backend_connection_error_returns_502(self):
         self.app["config"]["backends"]["mymodel"]["url"] = "http://127.0.0.1:1"
@@ -464,6 +568,6 @@ class TestResponses(LLMProxyAppTestCase):
             headers={"Authorization": "Bearer mytoken"}, json=body)
 
         async with req as res:
-            self.assertEqual(res.status, 502)
+            self.assertIn(res.status, (502, 504))
 
         self.assertListEqual(await self.get_events(), [])

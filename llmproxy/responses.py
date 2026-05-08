@@ -1,3 +1,4 @@
+import asyncio
 import datetime
 import decimal
 import json
@@ -159,7 +160,8 @@ def has_billable_usage(usage):
     return validate_usage(usage) is not None
 
 
-async def record_billing(f_req, user, usage, b_name, b_cfg):
+async def record_billing(
+        f_req, user, usage, b_name, b_cfg, db_error_reason=None):
     usage = validate_usage(usage)
     if usage is None:
         raise aiohttp.web.HTTPBadGateway(text="Invalid usage information")
@@ -178,7 +180,11 @@ async def record_billing(f_req, user, usage, b_name, b_cfg):
             request_id=f_req["request_id"],
         )
     except DatabaseError as e:
-        f_req.app.logger.critical(e)
+        if db_error_reason is not None:
+            log_responses_billing_missing(
+                f_req, user, b_name, b_cfg, db_error_reason, e)
+        else:
+            f_req.app.logger.critical(e)
         raise aiohttp.web.GracefulExit() from e
 
     f_req.app.logger.info("Client used: P:%d C:%d tokens of %s",
@@ -207,7 +213,8 @@ async def handle_non_stream(f_req, b_res, user, b_name, b_cfg):
     try:
         data = json.loads(body, parse_float=decimal.Decimal)
         usage = validate_usage(data["usage"])
-    except (json.decoder.JSONDecodeError, KeyError, TypeError) as e:
+    except (json.decoder.JSONDecodeError, KeyError, TypeError,
+            UnicodeDecodeError) as e:
         f_req.app.logger.error("Missing Responses usage information")
         raise aiohttp.web.HTTPBadGateway(
             text="Missing usage information") from e
@@ -225,11 +232,44 @@ def update_stream_usage(result, block):
     if not completed:
         return
 
+    if result.completed_seen:
+        result.invalid_usage_seen = True
+        return
+
     result.completed_seen = True
     if (valid := validate_usage(usage)) is not None:
         result.usage = valid
     else:
         result.invalid_usage_seen = True
+
+
+def client_disconnected(f_req):
+    transport = f_req.transport
+    return transport is None or transport.is_closing()
+
+
+def process_stream_chunk(app, result, buffer, chunk):
+    try:
+        for block in iter_sse_blocks(buffer, chunk):
+            update_stream_usage(result, block)
+    except SSEEventTooLarge as e:
+        result.error_reason = "sse_event_too_large"
+        result.error = e
+        app.logger.error("Backend SSE event too large: %s", e)
+        return False
+
+    return True
+
+
+async def drain_backend_stream(app, result, buffer, b_res):
+    try:
+        async for c in b_res.content.iter_chunked(SSE_READ_CHUNK_SIZE):
+            if not process_stream_chunk(app, result, buffer, c):
+                break
+    except (aiohttp.ClientError, TimeoutError, OSError) as e:
+        result.error_reason = "backend_stream_read_error"
+        result.error = e
+        app.logger.error("Backend stream read error: %s", e)
 
 
 async def handle_resp_stream(f_req, b_res):
@@ -249,16 +289,15 @@ async def handle_resp_stream(f_req, b_res):
     except OSError as e:
         client_connected = False
         app.logger.info("Client disconnected before stream prepare: %s", e)
+    except asyncio.CancelledError as e:
+        if not client_disconnected(f_req):
+            raise
+        client_connected = False
+        app.logger.info("Client disconnected before stream prepare: %s", e)
 
     try:
         async for c in b_res.content.iter_chunked(SSE_READ_CHUNK_SIZE):
-            try:
-                for block in iter_sse_blocks(buffer, c):
-                    update_stream_usage(result, block)
-            except SSEEventTooLarge as e:
-                result.error_reason = "sse_event_too_large"
-                result.error = e
-                app.logger.error("Backend SSE event too large: %s", e)
+            if not process_stream_chunk(app, result, buffer, c):
                 break
 
             if client_connected:
@@ -267,15 +306,30 @@ async def handle_resp_stream(f_req, b_res):
                 except OSError as e:
                     client_connected = False
                     app.logger.info("Client disconnected: %s", e)
+                except asyncio.CancelledError as e:
+                    if not client_disconnected(f_req):
+                        raise
+                    client_connected = False
+                    app.logger.info("Client disconnected: %s", e)
     except (aiohttp.ClientError, TimeoutError, OSError) as e:
         result.error_reason = "backend_stream_read_error"
         result.error = e
         app.logger.error("Backend stream read error: %s", e)
+    except asyncio.CancelledError as e:
+        if not client_disconnected(f_req):
+            raise
+        client_connected = False
+        app.logger.info("Client disconnected during backend stream read: %s", e)
+        await drain_backend_stream(app, result, buffer, b_res)
 
     if client_connected:
         try:
             await f_res.write_eof()
         except OSError as e:
+            app.logger.info("Client disconnected before stream EOF: %s", e)
+        except asyncio.CancelledError as e:
+            if not client_disconnected(f_req):
+                raise
             app.logger.info("Client disconnected before stream EOF: %s", e)
 
     return result
@@ -350,13 +404,16 @@ async def handle_backend_response(f_req, b_res, user, b_name, b_cfg,
     if is_sse_response(b_res):
         result = await handle_resp_stream(f_req, b_res)
         if (result.error_reason == "sse_event_too_large"
+                or result.invalid_usage_seen
                 or not has_billable_usage(result.usage)):
             log_responses_billing_missing(
                 f_req, user, b_name, b_cfg, stream_missing_reason(result),
                 result.error)
             return result.response
 
-        await record_billing(f_req, user, result.usage, b_name, b_cfg)
+        await record_billing(
+            f_req, user, result.usage, b_name, b_cfg,
+            db_error_reason="billing_db_error")
         return result.response
 
     if stream_requested:

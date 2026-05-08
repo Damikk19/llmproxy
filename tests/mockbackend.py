@@ -70,7 +70,21 @@ async def responses(req):
             headers={"Content-Type": "application/json"},
         )
 
+    if b.get("input") == "invalid_utf8_usage":
+        return aiohttp.web.Response(
+            body=b'{"id":"resp_invalid","usage":"\xff"}',
+            headers={"Content-Type": "application/json"},
+        )
+
     if b.get("input") == "non_stream_body_error":
+        res = aiohttp.web.StreamResponse(
+            headers={"Content-Type": "application/json"})
+        await res.prepare(req)
+        await res.write(b'{"id":"resp_partial",')
+        close_transport(req)
+        return res
+
+    if b.get("input") == "chunked_json_body_error_stream_requested":
         res = aiohttp.web.StreamResponse(
             headers={"Content-Type": "application/json"})
         await res.prepare(req)
@@ -124,6 +138,27 @@ async def responses(req):
                 b'data: {"response":\n'
                 b'data: {"usage":{"input_tokens":13,\n'
                 b'data: "output_tokens":17}}}\n\n')
+        elif b.get("input") == "split_completed_stream":
+            await res.write(b"event: response.completed\n")
+            await asyncio.sleep(0)
+            await res.write(
+                b'data: {"response":{"usage":{"input_tokens":19,')
+            await asyncio.sleep(0)
+            await res.write(b'"output_tokens":23}}}')
+            await asyncio.sleep(0)
+            await res.write(b"\n\n")
+        elif b.get("input") == "invalid_json_completed_stream":
+            await res.write(
+                b"event: response.completed\n"
+                b"data: {\n\n")
+        elif b.get("input") == "double_completed_stream":
+            await res.write(
+                b'event: response.completed\n'
+                b'data: {"response":{"usage":{"input_tokens":3,'
+                b'"output_tokens":5}}}\n\n')
+            await res.write(
+                b"event: response.completed\n"
+                b"data: null\n\n")
         elif b.get("input") == "invalid_usage_stream":
             await res.write(
                 b'event: response.completed\n'
