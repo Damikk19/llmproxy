@@ -19,7 +19,7 @@ from .db import get_db, shutdown_all
 
 
 # Multipart upload routes: exempt from the JSON body cap and allowed to send
-# multipart/form-data (other routes reject multipart with 415 to avoid OOM).
+# multipart/form-data (other routes reject multipart with 415).
 UPLOAD_PATHS = frozenset({
     "/v1/audio/transcriptions",
     "/v1/files/convert",
@@ -104,11 +104,8 @@ async def limit_request_body(req, handler):
     # chunked bodies with no Content-Length; aiohttp has no public per-route
     # limit), and reject early when the client declares an oversized body.
     if req.path not in UPLOAD_PATHS:
-        # Only upload routes consume multipart. On the JSON text endpoints a
-        # multipart body would be parsed by aiohttp's post(): each non-file
-        # field is read WHOLE into memory before _client_max_size is checked, so
-        # it bypasses the byte-bounded read below and lets an authenticated
-        # client OOM the single worker. Reject it here, before any body is read.
+        # Only upload routes consume multipart. Reject it on the JSON text
+        # endpoints before any body is read.
         if req.content_type == "multipart/form-data":
             raise aiohttp.web.HTTPUnsupportedMediaType(
                 text="multipart/form-data is not supported on this endpoint")

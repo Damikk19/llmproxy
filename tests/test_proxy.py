@@ -9,6 +9,7 @@ import sqlite3
 import sys
 import tempfile
 import time
+import tracemalloc
 import unittest
 import warnings
 import weakref
@@ -536,10 +537,8 @@ class TestChat(LLMProxyAppTestCase):
 
     async def test_multipart_rejected_on_text_endpoints(self):
         # multipart on a JSON endpoint is rejected with 415 in the middleware,
-        # BEFORE proxy.request would call post() and buffer the whole body into
-        # memory (aiohttp's post() reads each non-file field WHOLE before the
-        # size cap is checked -> an authenticated client could OOM the single
-        # worker). Without the guard these reach post()+the backend and 502;
+        # BEFORE proxy.request would call post() and read the body. Without
+        # the guard these reach post()+the backend and 502;
         # the 415 (not 502) proves the body was never read and bills nothing.
         for path in ("/v1/chat/completions", "/v1/completions",
                 "/v1/embeddings", "/v1/messages", "/v1/responses"):
@@ -556,7 +555,7 @@ class TestChat(LLMProxyAppTestCase):
 
     async def test_multipart_rejected_before_auth(self):
         # The guard lives in limit_request_body, ahead of the handler's auth,
-        # so the DoS vector is dropped without even a DB auth lookup: an INVALID
+        # so the body is dropped without even a DB auth lookup: an INVALID
         # token still yields 415, not 401 (which is what it would be if the
         # multipart body reached the handler's auth+post()).
         req = self.client.request("POST", "/v1/chat/completions",
@@ -853,9 +852,9 @@ class TestMalformedBody(LLMProxyAppTestCase):
         cases = [
             ("no boundary", b"garbage", "multipart/form-data"),
             ("garbage body", b"garbage", "multipart/form-data; boundary=xyz"),
-            # aiohttp's reader asserts here (AssertionError: Reading after EOF)
+            # ValueError: Reading after EOF
             ("truncated", part[:-2], "multipart/form-data; boundary=xyz"),
-            # ...and here (assert field.name is not None)
+            # ValueError: Multipart field missing name.
             ("part without name",
                 b'--xyz\r\nContent-Disposition: form-data\r\n\r\nx\r\n'
                 b"--xyz--\r\n", "multipart/form-data; boundary=xyz"),
@@ -899,6 +898,40 @@ class TestMalformedBody(LLMProxyAppTestCase):
                         self._raw(path, body, content_type), path)
                     self.assertEqual(msg,
                         "Malformed multipart/form-data body.")
+
+    async def test_part_name_unfit_for_backend_is_400(self):
+        # A part name or filename has to go into the part headers sent to the
+        # backend: no control characters (name*= and filename*= can
+        # percent-encode them) and nothing that isn't UTF-8.
+        file_part = (b'--xyz\r\nContent-Disposition: form-data; name="file"; '
+            b'filename="a.bin"\r\n\r\nabc\r\n')
+        cases = [
+            ("filename", b'name="file"; filename*=utf-8\'\'a%01b.bin'),
+            ("filename with newline",
+                b'name="file"; filename*=utf-8\'\'a%0D%0Ab.bin'),
+            ("field name", b"name*=utf-8''x%01y"),
+            ("filename not in UTF-8",
+                b'name="file"; filename="za\xbf\xf3\xb3\xe6.bin"'),
+            ("field name not in UTF-8", b'name="x\xffy"'),
+        ]
+        for path, model in (("/v1/audio/transcriptions", b"mywhisper"),
+                ("/v1/files/convert", b"mymarker")):
+            for name, disposition in cases:
+                with self.subTest(case=name, path=path):
+                    body = (b'--xyz\r\nContent-Disposition: form-data; '
+                        b'name="model"\r\n\r\n' + model + b"\r\n"
+                        + (file_part if name.startswith("field") else b"")
+                        + b"--xyz\r\nContent-Disposition: form-data; "
+                        + disposition + b"\r\n\r\nabc\r\n--xyz--\r\n")
+                    with self.assertLogs("aiohttp.web", level="INFO") as logs:
+                        msg = await self._assert_400(self._raw(path, body,
+                            "multipart/form-data; boundary=xyz"), path)
+                    self.assertEqual(msg,
+                        "Malformed multipart/form-data body.")
+                    # The type, not the repr, which would quote the name.
+                    [line] = [l for l in logs.output
+                        if "Malformed request body" in l]
+                    self.assertRegex(line, r" error=\w+ at \S+:\d+ \w+$")
 
     async def test_body_not_matching_content_encoding_is_400(self):
         # aiohttp decompresses by Content-Encoding and fails the read with
@@ -1009,6 +1042,36 @@ class TestMalformedBody(LLMProxyAppTestCase):
                         self.assertLogs("aiohttp.server", level="ERROR"):
                     async with self._raw(path, body, content_type) as res:
                         self.assertEqual(res.status, 500)
+
+
+class TestUnroutedRequests(LLMProxyAppTestCase):
+    async def test_unrouted_requests_do_not_grow_memory(self):
+        # Requests that match no route (404, 405, CORS preflight) must not
+        # grow memory without bound (aiohttp 3.10.6-3.10.10 cached a
+        # middleware chain for each of them). Bounded caches (yarl's URL
+        # caches) stay well under the limit.
+        # Not self.client: it keeps every response until teardown.
+        session = aiohttp.ClientSession()
+        self.addAsyncCleanup(session.close)
+
+        async def burst(start, n):
+            for i in range(start, start + n):
+                for method, path, status in (
+                        ("GET", "/v1/no-such-path-%d" % i, 404),
+                        ("GET", "/v1/chat/completions", 405),
+                        ("OPTIONS", "/v1/chat/completions", 200)):
+                    url = self.client.make_url(path)
+                    async with session.request(method, url) as res:
+                        self.assertEqual(res.status, status)
+
+        await burst(0, 100)  # let bounded caches fill up first
+        gc.collect()
+        tracemalloc.start()
+        self.addCleanup(tracemalloc.stop)
+        await burst(100, 300)
+        gc.collect()
+        grown, _ = tracemalloc.get_traced_memory()
+        self.assertLess(grown, 1024 * 1024)
 
 
 class TestConfigValidation(unittest.IsolatedAsyncioTestCase):

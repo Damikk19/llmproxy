@@ -1,7 +1,6 @@
-FROM alpine:3.21.3
+FROM alpine:3.21.8
 
 RUN apk add \
-	py3-aiohttp \
 	py3-aiosqlite \
 	py3-gpep517 \
 	py3-installer \
@@ -9,12 +8,15 @@ RUN apk add \
 	py3-pip \
 	py3-prometheus-client \
 	py3-setuptools \
-	py3-yarl \
 	python3 \
 	sqlite
 
-# motor is not present in Alpine Linux package repositories
-RUN pip install --break-system-packages motor==3.5.0
+# Alpine's aiohttp lags behind security fixes (keep these pins in sync with
+# .gitlab-ci.yml), and motor is not packaged at all.
+RUN pip install --break-system-packages --no-cache-dir \
+	aiohttp==3.14.3 \
+	motor==3.5.0 \
+	yarl==1.25.1
 
 WORKDIR /root/llmproxy
 COPY scripts scripts

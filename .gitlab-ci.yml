@@ -4,10 +4,12 @@ stages:
 
 test-job:
   stage: test
-  image: alpine:3.20.3
+  image: alpine:3.21.8
   dependencies: []
   script:
-    - apk add py3-aiohttp py3-aiosqlite py3-prometheus-client py3-yarl
+    # Same base image and aiohttp/yarl pins as the Dockerfile.
+    - apk add py3-aiosqlite py3-pip py3-prometheus-client
+    - pip install --break-system-packages aiohttp==3.14.3 yarl==1.25.1
     - python3 -m unittest
 
 image-job:

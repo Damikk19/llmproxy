@@ -44,11 +44,12 @@ def _bad_request(f_req, message, param=None):
 
 # What aiohttp and the stdlib raise while reading a body the client got wrong:
 # ValueError (bad JSON, text not valid in its charset, an int over Python's
-# digit limit, a bad multipart boundary or base64), LookupError (unknown
-# charset), RuntimeError (JSON nested too deep, unknown transfer encoding),
-# HttpProcessingError (bad multipart part headers), RequestPayloadError (body
-# doesn't match its Content-Encoding) and AssertionError (truncated multipart
-# body, part without a name).
+# digit limit, a bad multipart boundary or base64, a truncated multipart body,
+# a part without a name), LookupError (unknown charset), RuntimeError (JSON
+# nested too deep, unknown transfer encoding), HttpProcessingError (bad
+# multipart part headers) and RequestPayloadError (body doesn't match its
+# Content-Encoding). AssertionError is what older aiohttp raised for a
+# truncated multipart body or a part without a name.
 _MALFORMED_BODY_ERRORS = (ValueError, LookupError, RuntimeError,
     AssertionError, http_exceptions.HttpProcessingError,
     aiohttp.web.RequestPayloadError)
@@ -173,16 +174,26 @@ async def request(f_req, body_transform=None, user=None, path=None, *,
         # aiohttp payload registries reject -- unwrap to the real file object
         # (or fall back to reading bytes) so audio/PDF uploads forward cleanly.
         d = aiohttp.FormData()
-        for key, value in b_body.items():
-            if isinstance(value, aiohttp.web.FileField):
-                raw = value.file
-                if hasattr(raw, "file"):
-                    raw = raw.file
-                d.add_field(key, raw, content_type=value.content_type,
-                    filename=value.filename)
-            else:
-                d.add_field(key, value)
-        b_body = d
+        try:
+            for key, value in b_body.items():
+                if isinstance(value, aiohttp.web.FileField):
+                    raw = value.file
+                    if hasattr(raw, "file"):
+                        raw = raw.file
+                    d.add_field(key, raw, content_type=value.content_type,
+                        filename=value.filename)
+                else:
+                    d.add_field(key, value)
+            b_body = d()
+        except ValueError as e:
+            # A part name or filename that can't go into the part headers:
+            # a control character (name*= and filename*= can percent-encode
+            # one) or bytes that aren't UTF-8 (UnicodeEncodeError). Only the
+            # type is logged: a UnicodeEncodeError's repr quotes the name.
+            app.logger.info(
+                "Malformed request body: request_id=%s error=%s at %s",
+                f_req["request_id"], type(e).__name__, _raised_at(e))
+            raise _bad_request(f_req, "Malformed multipart/form-data body.")
 
     try:
         app.logger.debug("Sending backend request")
